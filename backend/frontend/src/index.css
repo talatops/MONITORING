@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  body {
+    @apply m-0 font-mono text-sm leading-normal;
+  }
+
+  /* Thin scrollbar for log panel */
+  .scroll-thin::-webkit-scrollbar { width: 4px; height: 4px; }
+  .scroll-thin::-webkit-scrollbar-track { background: transparent; }
+  .scroll-thin::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-slate-700;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-surface-border bg-surface-raised p-4;
+  }
+
+  .badge {
+    @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold;
+  }
+
+  .badge-green  { @apply badge bg-emerald-900/60 text-emerald-300; }
+  .badge-red    { @apply badge bg-red-900/60 text-red-300; }
+  .badge-yellow { @apply badge bg-amber-900/60 text-amber-300; }
+  .badge-gray   { @apply badge bg-slate-700 text-slate-300; }
+}
+
+/* ── Container marquee ────────────────────────────────────────────────────────
+   GPU-composited, sub-pixel smooth horizontal scroll (no scrollLeft rounding
+   stutter). The track holds the list rendered 3x and translates left by exactly
+   one copy (--marquee-shift), then loops. Pauses on hover, or when .paused is
+   set (detail modal open / content already fits the viewport). */
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to   { transform: translateX(calc(-1 * var(--marquee-shift, 0px))); }
+}
+
+.marquee-track {
+  animation-name: marquee;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+  will-change: transform;
+  backface-visibility: hidden;
+}
+
+.marquee-wrap:hover .marquee-track,
+.marquee-track.paused {
+  animation-play-state: paused;
+}

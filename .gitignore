@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Build output
+backend/frontend/dist/
+backend/cmd/server/dist/
+*.exe
+
+# SQLite database files
+*.db
+*.db-shm
+*.db-wal
+
+# OS / editor
+.DS_Store
