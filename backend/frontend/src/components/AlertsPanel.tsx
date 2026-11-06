@@ -16,7 +16,7 @@ import {
 } from "../hooks/useResources";
 import { ActionError, ensureAdminToken, invalidateAdminToken } from "../lib/api";
 import { confirmAction } from "../lib/confirm";
-import type { Alert, AlertChannel, AlertRule, SMTPSettings } from "../types";
+import type { Alert, AlertChannel, AlertRule } from "../types";
 
 // ── small helpers ─────────────────────────────────────────────────────────────
 
