@@ -436,11 +436,11 @@ func (s *Server) sendWithRetry(c AlertChannel, a Alert) deliveryResult {
 		if d > 0 {
 			time.Sleep(d)
 		}
-		if err := s.notifier.Send(c, a); err == nil {
+		lastErr = s.notifier.Send(c, a)
+		if lastErr == nil {
 			return deliveryResult{Status: "ok", Attempts: i + 1}
 		}
-		lastErr = err
-		log.Printf("alerts: notify %s (%s) attempt %d: %v", c.Name, c.Kind, i+1, err)
+		log.Printf("alerts: notify %s (%s) attempt %d: %v", c.Name, c.Kind, i+1, lastErr)
 	}
 	msg := ""
 	if lastErr != nil {
