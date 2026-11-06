@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import type { Topology, VolumeInfo, ImageInfo, HostInfo, ImageVulnScan, ScanSummary, SecurityOverview } from "../types";
+import type { Topology, VolumeInfo, ImageInfo, HostInfo, ImageVulnScan, ScanSummary, SecurityOverview, ScanTrend, AlertRule, AlertChannel, Alert, SMTPSettings } from "../types";
 import { API_BASE } from "../lib/constants";
 import { apiAction, withHost } from "../lib/api";
 
@@ -142,4 +142,112 @@ export function useSecurityOverview(refreshMs = 30000): Async<SecurityOverview> 
     return () => clearInterval(t);
   }, [reload, refreshMs]);
   return res;
+}
+
+/** useImageHistory returns counts-only trend points for one image (oldest-first). */
+export function useImageHistory(ref: string, host?: string, enabled = true): Async<ScanTrend[]> {
+  return useJson<ScanTrend[]>(
+    withHost(`${API_BASE}/images/history?ref=${encodeURIComponent(ref)}`, host),
+    enabled && ref !== "",
+  );
+}
+
+/** sbomDownloadURL builds a direct download URL for an image SBOM. */
+export function sbomDownloadURL(ref: string, format: "cyclonedx" | "spdx", host?: string): string {
+  return withHost(
+    `${API_BASE}/images/sbom?ref=${encodeURIComponent(ref)}&format=${format}`,
+    host,
+  );
+}
+
+/** securityReportURL builds a direct download URL for the fleet report. */
+export function securityReportURL(format: "csv" | "json"): string {
+  return `${API_BASE}/security/report?format=${format}`;
+}
+
+// ── Phase 8: alerting — rules, channels, history, and delivery actions ────────
+// Alert config lives on the hub (not per-agent), so these paths are not
+// host-scoped. Reads poll the local SQLite-backed endpoints; mutations go
+// through apiAction with the admin bearer token.
+
+/** useAlertRules lists configured alert rules. */
+export function useAlertRules(refreshMs = 20000): Async<AlertRule[]> {
+  const res = useJson<AlertRule[]>(`${API_BASE}/alerts/rules`, true);
+  const { reload } = res;
+  useEffect(() => {
+    const t = setInterval(reload, refreshMs);
+    return () => clearInterval(t);
+  }, [reload, refreshMs]);
+  return res;
+}
+
+/** useAlertChannels lists configured delivery channels. */
+export function useAlertChannels(refreshMs = 20000): Async<AlertChannel[]> {
+  const res = useJson<AlertChannel[]>(`${API_BASE}/alerts/channels`, true);
+  const { reload } = res;
+  useEffect(() => {
+    const t = setInterval(reload, refreshMs);
+    return () => clearInterval(t);
+  }, [reload, refreshMs]);
+  return res;
+}
+
+/** useAlerts polls firing/resolved alert history. */
+export function useAlerts(status = "", limit = 100, refreshMs = 15000): Async<Alert[]> {
+  const qs = new URLSearchParams();
+  if (status) qs.set("status", status);
+  if (limit) qs.set("limit", String(limit));
+  const q = qs.toString();
+  const res = useJson<Alert[]>(`${API_BASE}/alerts${q ? `?${q}` : ""}`, true);
+  const { reload } = res;
+  useEffect(() => {
+    const t = setInterval(reload, refreshMs);
+    return () => clearInterval(t);
+  }, [reload, refreshMs]);
+  return res;
+}
+
+export async function saveAlertRule(rule: AlertRule): Promise<AlertRule> {
+  const r = await apiAction<AlertRule>("POST", "/alerts/rules", undefined, rule);
+  return r as AlertRule;
+}
+
+export async function deleteAlertRule(id: string): Promise<void> {
+  await apiAction("DELETE", `/alerts/rules/${encodeURIComponent(id)}`);
+}
+
+export async function saveAlertChannel(ch: AlertChannel): Promise<AlertChannel> {
+  const r = await apiAction<AlertChannel>("POST", "/alerts/channels", undefined, ch);
+  return r as AlertChannel;
+}
+
+export async function deleteAlertChannel(id: string): Promise<void> {
+  await apiAction("DELETE", `/alerts/channels/${encodeURIComponent(id)}`);
+}
+
+export async function testAlertChannel(channelId: string): Promise<void> {
+  await apiAction("POST", "/alerts/test", undefined, { channel_id: channelId });
+}
+
+/** useSMTPSettings reads the effective SMTP config (password never returned). */
+export function useSMTPSettings(): Async<SMTPSettings> {
+  return useJson<SMTPSettings>(`${API_BASE}/alerts/smtp`, true);
+}
+
+export async function saveSMTPSettings(s: SMTPSettings): Promise<SMTPSettings> {
+  const r = await apiAction<SMTPSettings>("POST", "/alerts/smtp", undefined, s);
+  return r as SMTPSettings;
+}
+
+/** testSMTP sends a one-off test email to `to` using the saved SMTP settings. */
+export async function testSMTP(to: string): Promise<void> {
+  await apiAction("POST", "/alerts/smtp/test", undefined, { to });
+}
+
+export async function ackAlert(id: string, note: string): Promise<void> {
+  await apiAction("POST", `/alerts/${encodeURIComponent(id)}/ack`, undefined, { note });
+}
+
+export async function resolveAlert(id: string): Promise<void> {
+  await apiAction("POST", `/alerts/${encodeURIComponent(id)}/resolve`, undefined, {});
 }

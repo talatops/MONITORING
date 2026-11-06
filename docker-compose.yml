@@ -1,0 +1,105 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Docker + Linux monitoring — host stack.
+#
+#   docker compose up -d --build       # from the repo root (f:/MONITORING)
+#
+# The `monitor` service is the hub + embedded UI on :8080. It is containerised,
+# so it discovers and streams HOST containers via the mounted Docker socket,
+# and reads host-wide CPU/mem via the container's (host-visible) /proc.
+#
+# NOTE ON FIDELITY: a container sees host CPU/mem and all Docker objects, but
+# host *network/disk* counters and the Linux-forensics views (per-container
+# cgroup v2 detail, kernel-log mining) are namespaced and read from the STANDARD
+# /proc & /sys/fs/cgroup paths — so they are limited inside the container. For
+# full host fidelity either (a) uncomment the privileged mounts below, or (b)
+# run the binary / agent directly on the host (see the docs at the bottom).
+#
+# SECURITY: mounting /var/run/docker.sock grants the container root-equivalent
+# control of the host daemon. Only run this on machines you trust, and do not
+# expose :8080 publicly without a reverse proxy + TLS + an admin token.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  monitor:
+    build:
+      context: ./backend            # go.mod lives here; Dockerfile is backend/Dockerfile
+      dockerfile: Dockerfile
+      args:
+        INSTALL_TRIVY: "true"       # set "false" for a lean image without scanning
+    image: monitor:latest
+    container_name: monitor
+    restart: unless-stopped
+    command: ["-addr", ":8080", "-db", "/data/monitoring.db"]
+    environment:
+      # Mutating actions (start/stop/delete/pull/scan) require this bearer token.
+      MONITOR_ADMIN_TOKEN: ${MONITOR_ADMIN_TOKEN:-changeme}
+      # Shared secret remote agents present to connect (empty disables agents).
+      MONITOR_ENROLL_TOKEN: ${MONITOR_ENROLL_TOKEN:-}
+    ports:
+      - "8080:8080"
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock   # discover/inspect/stream host containers
+        target: /var/run/docker.sock
+        read_only: true
+      - monitor-data:/data             # SQLite DB (metrics, logs, image scans)
+      - trivy-cache:/trivy-cache       # Trivy CVE DB (avoids re-download)
+      # ── Optional: full host fidelity (uncomment to enable) ──────────────
+      # Read the REAL host cgroup v2 tree (per-container cgroup tab):
+      # - type: bind
+      #   source: /sys/fs/cgroup
+      #   target: /sys/fs/cgroup
+      #   read_only: true
+      # Host network + disk counters need the host namespaces too:
+      #   network_mode: host
+    # See the host's real process table so `docker top`-style views work.
+    pid: host
+    # Kernel-log mining (dmesg/kmsg) needs CAP_SYSLOG; add privileged:true (or
+    # cap_add: [SYSLOG, DAC_READ_SEARCH]) only if you use the Forensics tab.
+    # privileged: true
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    # Scrapes the monitor hub's Prometheus text endpoint over the compose network.
+    ports:
+      - "9090:9090"
+    volumes:
+      - type: bind
+        source: ./prometheus.yml
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+      - prometheus-data:/prometheus       # TSDB so series survive restarts
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle            # allows POST /-/reload
+
+volumes:
+  monitor-data:
+  trivy-cache:
+  prometheus-data:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Remote hosts (Phase "agent" mode): run the SAME image on each Linux box and
+# point it at this hub. It streams that host's metrics + answers scan/posture
+# RPCs; no UI/DB runs in agent mode. Copy this block into the remote host's own
+# compose file (or `docker run` it) with your real hub address.
+#
+#   agent:
+#     image: monitor:latest
+#     restart: unless-stopped
+#     command:
+#       - -mode=agent
+#       - -hub-url=wss://your-hub.example:8080/ws/agent   # ws:// for plain http
+#       - -host-id=kali-01
+#       - -name="Kali Lab"
+#     environment:
+#       MONITOR_ENROLL_TOKEN: ${MONITOR_ENROLL_TOKEN:-}    # must match the hub
+#     volumes:
+#       - /var/run/docker.sock:/var/run/docker.sock:ro
+#     pid: host
+#     # (optional) bind-mount / and /var/log read-only so the agent's Trivy can
+#     # reach the daemon + kernel logs for the Security tab on that host.
+# ─────────────────────────────────────────────────────────────────────────────

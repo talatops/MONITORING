@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useVolumes, removeVolume } from "../hooks/useResources";
-import { ActionError, ensureAdminToken, invalidateAdminToken } from "../lib/api";
+import { ActionError, invalidateAdminToken } from "../lib/api";
+import { confirmAction } from "../lib/confirm";
 
 function fmtBytes(b: number): string {
   if (b <= 0) return "0 B";
@@ -20,11 +21,14 @@ export default function VolumePanel({ host }: { host?: string }) {
 
   async function doRemove(name: string) {
     if (busy) return;
-    const force = window.confirm(
-      `Remove volume "${name}"?\n\nClick OK for a forced removal (detaches it from any running containers), Cancel to abort.`,
-    );
-    if (!force) return;
-    if (!ensureAdminToken()) return;
+    const confirmed = await confirmAction({
+      title: "Remove volume",
+      message: `Remove volume "${name}"?\n\nThis force-detaches it from any running containers and deletes it.`,
+      confirmLabel: "Remove",
+      danger: true,
+      requireAdmin: true,
+    });
+    if (!confirmed) return;
     setBusy(name);
     setMsg(null);
     try {
@@ -32,7 +36,7 @@ export default function VolumePanel({ host }: { host?: string }) {
       setMsg(`Removed volume ${name}`);
       reload();
     } catch (e) {
-      if (e instanceof ActionError && (e.status === 401 || e.status === 403)) invalidateAdminToken();
+      if (e instanceof ActionError && (e.status === 401 || e.status === 403)) invalidateAdminToken(e.status);
       setMsg(`Remove failed: ${(e as Error).message}`);
     } finally {
       setBusy(null);

@@ -130,6 +130,7 @@ export interface TopologyNode {
 export interface TopologyEdge {
   source: string;
   target: string;
+  ip?: string;
 }
 
 /** Mirrors collector.Topology */
@@ -257,6 +258,26 @@ export interface Vulnerability {
   title?: string;
 }
 
+/** Mirrors collector.SecretFinding — one leaked-secret result. */
+export interface SecretFinding {
+  rule_id: string;
+  severity: string;
+  category: string;
+  title: string;
+  match: string;
+  file: string;
+}
+
+/** Mirrors collector.MisconfigFinding — one IaC/Dockerfile misconfiguration. */
+export interface MisconfigFinding {
+  id: string;
+  title: string;
+  severity: string;
+  resolution: string;
+  type: string;
+  messages?: string[];
+}
+
 /** Mirrors collector.ImageVulnScan — the cached Trivy result for one image. */
 export interface ImageVulnScan {
   ref: string;
@@ -265,6 +286,10 @@ export interface ImageVulnScan {
   scanned_at: string; // RFC3339
   counts: Record<string, number>;
   vulnerabilities: Vulnerability[];
+  secrets?: SecretFinding[];
+  misconfigurations?: MisconfigFinding[];
+  secret_count?: number;
+  misconfig_count?: number;
 }
 
 /** Lean POST /images/scan response (counts only). */
@@ -275,6 +300,8 @@ export interface ScanSummary {
   scanned_at: string;
   counts: Record<string, number>;
   total: number;
+  secret_count?: number;
+  misconfig_count?: number;
   host?: string;
 }
 
@@ -312,6 +339,17 @@ export interface ImageExposure {
   scanned: boolean;
   scanned_at?: string;
   hosts: string[];
+  secret_count?: number;
+  misconfig_count?: number;
+}
+
+/** storage.ScanTrend — one counts-only history point for the trend chart. */
+export interface ScanTrend {
+  scanned_at: string;
+  counts: Record<string, number>;
+  total: number;
+  secret_count: number;
+  misconfig_count: number;
 }
 
 /** api.SecurityOverview — GET /security/overview payload. */
@@ -320,6 +358,71 @@ export interface SecurityOverview {
   hosts: HostSecurity[];
   image_exposure: ImageExposure[];
   risky_containers: ContainerSecurity[];
+  auto_scan?: boolean;
+  scan_interval?: string;
+}
+
+// ── Phase 8: alerting — rules, channels, and firing/resolved alerts ────────────
+
+/** Mirrors collector.AlertRule — one configurable alert condition. */
+export interface AlertRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  type: "host" | "container" | "cve" | "offline" | string;
+  metric?: string;         // host: cpu|mem|disk|swap|load1
+  op?: string;             // ">" | "<"
+  threshold: number;       // host threshold value
+  for_seconds: number;     // sustained window before firing
+  severity: string;        // info | warning | critical
+  event_kinds?: string[];  // container: exit | oom | unhealthy
+  min_severity?: string;   // cve: CRITICAL | HIGH
+  count_threshold?: number;
+  cooldown_seconds: number;
+  channel_ids?: string[];  // empty = all enabled channels
+}
+
+/** Mirrors collector.AlertChannel — a delivery target. */
+export interface AlertChannel {
+  id: string;
+  name: string;
+  kind: "webhook" | "slack" | "email" | string;
+  enabled: boolean;
+  url?: string;   // webhook / slack endpoint
+  to?: string;    // email recipient(s), comma-separated
+}
+
+/** Mirrors collector.Alert — one firing/resolved alert instance. */
+export interface Alert {
+  id: string;
+  rule_id: string;
+  rule_name: string;
+  type: string;
+  severity: string;
+  status: "firing" | "resolved" | string;
+  resource: string;
+  metric?: string;
+  value: number;
+  threshold: number;
+  summary: string;
+  detail?: string;
+  started_at: string;          // RFC3339Nano
+  resolved_at?: string;
+  notified?: string;           // JSON: per-channel delivery result
+  acked: boolean;
+  acked_at?: string;
+  ack_note?: string;
+}
+
+/** GET/POST /alerts/smtp payload. Password is write-only (never returned). */
+export interface SMTPSettings {
+  host: string;
+  port: number;
+  from: string;
+  user: string;
+  password?: string;     // sent on save only; "" keeps existing
+  has_password: boolean;
+  source?: string;       // "db" | "env"
 }
 
 // ── WebSocket envelope ────────────────────────────────────────────────────────
@@ -336,7 +439,8 @@ export type WSMessageType =
   | "container_stats"
   | "container_log"
   | "container_list"
-  | "kernel_event";
+  | "kernel_event"
+  | "alert";
 
 // Narrowed payload types. `host` tags which monitored host produced the frame
 // (empty/absent is treated as the hub's local host).
@@ -345,13 +449,15 @@ export interface ContainerStatsMsg { type: "container_stats"; data: ContainerSta
 export interface ContainerLogMsg  { type: "container_log";   data: LogEntry;              host?: string }
 export interface ContainerListMsg { type: "container_list";  data: ContainerInfo[];        host?: string }
 export interface KernelEventMsg    { type: "kernel_event";     data: KernelEvent;           host?: string }
+export interface AlertMsg          { type: "alert";            data: Alert;                 host?: string }
 
 export type TypedWSMessage =
   | HostMetricsMsg
   | ContainerStatsMsg
   | ContainerLogMsg
   | ContainerListMsg
-  | KernelEventMsg;
+  | KernelEventMsg
+  | AlertMsg;
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
 

@@ -16,6 +16,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/monitoring/backend/agent"
@@ -39,7 +40,14 @@ func main() {
 		"Host metric polling interval")
 
 	// Security + identity (server and agent share the enroll/admin tokens).
-	adminToken := flag.String("admin-token", os.Getenv("MONITOR_ADMIN_TOKEN"),
+	// Admin token is hardcoded to "changeme" as the out-of-the-box default so
+	// localhost mutating actions work without extra config; override via the
+	// MONITOR_ADMIN_TOKEN env var or the -admin-token flag.
+	defaultAdminToken := os.Getenv("MONITOR_ADMIN_TOKEN")
+	if defaultAdminToken == "" {
+		defaultAdminToken = "changeme"
+	}
+	adminToken := flag.String("admin-token", defaultAdminToken,
 		"Bearer token required on mutating endpoints; empty disables actions [server]")
 	enrollToken := flag.String("enroll-token", os.Getenv("MONITOR_ENROLL_TOKEN"),
 		"Shared secret agents present to connect; empty disables agent access")
@@ -53,6 +61,31 @@ func main() {
 		"Comma-separated Trivy severities to report (e.g. CRITICAL,HIGH)")
 	scanTimeout := flag.Duration("scan-timeout", cfg.ScanTimeout,
 		"Per-image Trivy scan deadline (e.g. 10m)")
+	scanModes := flag.String("scan-modes", cfg.ScanModes,
+		"Comma-separated Trivy scanner modes (e.g. vuln,secret,misconfig)")
+	autoScan := flag.Bool("auto-scan", cfg.AutoScan,
+		"Periodically scan the local host's in-use images (requires Trivy on PATH)")
+	scanInterval := flag.Duration("scan-interval", cfg.ScanInterval,
+		"Background scan interval when -auto-scan is set (min 5m, e.g. 24h)")
+
+	// Alerting (Phase 8). SMTP credentials are flag/env only — the password is
+	// never persisted to the database or exposed in the UI.
+	alertInterval := flag.Duration("alert-interval", cfg.AlertInterval,
+		"Alert rule evaluation interval (min 10s) [server]")
+	smtpDefaultPort := cfg.SMTPPort
+	if v, err := strconv.Atoi(os.Getenv("MONITOR_SMTP_PORT")); err == nil && v > 0 {
+		smtpDefaultPort = v
+	}
+	smtpHost := flag.String("smtp-host", os.Getenv("MONITOR_SMTP_HOST"),
+		"SMTP server host for email alerts; empty disables the email channel [server]")
+	smtpPort := flag.Int("smtp-port", smtpDefaultPort,
+		"SMTP server port (587 STARTTLS, 465 implicit TLS) [server]")
+	smtpFrom := flag.String("smtp-from", os.Getenv("MONITOR_SMTP_FROM"),
+		"From address for alert emails [server]")
+	smtpUser := flag.String("smtp-user", os.Getenv("MONITOR_SMTP_USER"),
+		"SMTP username; empty = no auth [server]")
+	smtpPass := flag.String("smtp-pass", os.Getenv("MONITOR_SMTP_PASSWORD"),
+		"SMTP password (env/flag only, never stored) [server]")
 
 	// Agent-only flags.
 	hubURL := flag.String("hub-url", "", "Hub WebSocket URL to connect to, e.g. wss://hub:8080/ws/agent [agent]")
@@ -141,6 +174,15 @@ func main() {
 		TrivyBinary:    *trivyBin,
 		ScanSeverities: *scanSeverities,
 		ScanTimeout:    *scanTimeout,
+		ScanModes:      *scanModes,
+		AutoScan:       *autoScan,
+		ScanInterval:   *scanInterval,
+		AlertInterval:  *alertInterval,
+		SMTPHost:       *smtpHost,
+		SMTPPort:       *smtpPort,
+		SMTPFrom:       *smtpFrom,
+		SMTPUser:       *smtpUser,
+		SMTPPassword:   *smtpPass,
 	}
 
 	srv := api.New(serverCfg, hub, dc, hc, db)

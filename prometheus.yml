@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Prometheus scrape config for the monitoring hub.
+# Mounted read-only into the `prometheus` service in docker-compose.yml.
+# The hub exposes an unauthenticated Prometheus text endpoint at /metrics, so
+# no bearer token / authorization is configured here.
+# ─────────────────────────────────────────────────────────────────────────────
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: docker-monitoring
+
+scrape_configs:
+  # The hub itself: host + container metrics, counts and scan totals.
+  # `monitor` resolves to the hub service over the default compose network.
+  - job_name: "monitor"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["monitor:8080"]
+
+  # Prometheus' own self-metrics (optional, handy for monitoring the monitor).
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

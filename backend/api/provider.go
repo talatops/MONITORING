@@ -33,6 +33,7 @@ type ResourceProvider interface {
 	ContainerAction(ctx context.Context, id, op string, force bool) error
 	RemoveVolume(ctx context.Context, name string, force bool) error
 	ScanImage(ctx context.Context, ref string, opts collector.ScanOptions) (collector.ImageVulnScan, error)
+	ScanSBOM(ctx context.Context, ref string, opts collector.SBOMOptions) (json.RawMessage, string, error)
 	SecurityPosture(ctx context.Context) ([]collector.ContainerSecurity, error)
 }
 
@@ -157,6 +158,12 @@ func (p *agentProxy) ScanImage(ctx context.Context, ref string, opts collector.S
 	var out collector.ImageVulnScan
 	err := p.call(ctx, ActImageScan, ArgImageScan{Ref: ref, Opts: opts}, &out, defaultScanTimeout)
 	return out, err
+}
+
+func (p *agentProxy) ScanSBOM(ctx context.Context, ref string, opts collector.SBOMOptions) (json.RawMessage, string, error) {
+	var out SBOMResult
+	err := p.call(ctx, ActImageSBOM, ArgImageSBOM{Ref: ref, Opts: opts}, &out, defaultScanTimeout)
+	return out.Doc, out.Name, err
 }
 
 func (p *agentProxy) SecurityPosture(ctx context.Context) ([]collector.ContainerSecurity, error) {

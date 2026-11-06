@@ -3,6 +3,7 @@ import type { ContainerCgroupStats, ContainerInfo, ContainerStatsSnapshot, LogEn
 import { useContainerTop, useContainerInspect, useContainerCgroup } from "../hooks/useContainerExtras";
 import { containerAction } from "../hooks/useResources";
 import { ActionError, ensureAdminToken, invalidateAdminToken } from "../lib/api";
+import { confirmAction } from "../lib/confirm";
 
 // ── Formatting helpers (kept local to avoid a circular import with ContainerList) ──
 
@@ -225,11 +226,20 @@ export default function ContainerDetailModal({
 
   async function runAction(op: "start" | "stop" | "restart" | "remove") {
     if (busy) return;
-    const force =
-      op === "remove" &&
-      window.confirm(`Remove container "${container.name || container.id}"?\n\nOK force-removes it (and its anonymous volumes); Cancel to abort.`);
-    if (op === "remove" && !force) return;
-    if (!ensureAdminToken()) return;
+    let force = false;
+    if (op === "remove") {
+      const confirmed = await confirmAction({
+        title: "Remove container",
+        message: `Remove container "${container.name || container.id}"?\n\nThis force-removes it (and its anonymous volumes).`,
+        confirmLabel: "Remove",
+        danger: true,
+        requireAdmin: true,
+      });
+      if (!confirmed) return;
+      force = true;
+    } else if (!(await ensureAdminToken())) {
+      return;
+    }
     setBusy(op);
     setActionMsg(null);
     try {
@@ -237,7 +247,7 @@ export default function ContainerDetailModal({
       setActionMsg(`${op.charAt(0).toUpperCase()}${op.slice(1)} sent`);
       if (op === "remove") onClose();
     } catch (e) {
-      if (e instanceof ActionError && (e.status === 401 || e.status === 403)) invalidateAdminToken();
+      if (e instanceof ActionError && (e.status === 401 || e.status === 403)) invalidateAdminToken(e.status);
       setActionMsg(`${op} failed: ${(e as Error).message}`);
     } finally {
       setBusy(null);

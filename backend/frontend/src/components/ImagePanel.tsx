@@ -7,8 +7,10 @@ import {
   pruneAllImages,
   deleteImage,
   scanImage,
+  sbomDownloadURL,
 } from "../hooks/useResources";
 import { ActionError, ensureAdminToken, invalidateAdminToken } from "../lib/api";
+import { confirmAction } from "../lib/confirm";
 import type { ImageInfo } from "../types";
 
 function fmtBytes(b: number): string {
@@ -33,7 +35,7 @@ function primaryTag(img: ImageInfo): string {
 // Handle an auth rejection by clearing the stored token so the next attempt
 // re-prompts; return the human-readable message for the inline status line.
 function fail(e: unknown, verb: string): string {
-  if (e instanceof ActionError && (e.status === 401 || e.status === 403)) invalidateAdminToken();
+  if (e instanceof ActionError && (e.status === 401 || e.status === 403)) invalidateAdminToken(e.status);
   return `${verb} failed: ${(e as Error).message}`;
 }
 
@@ -69,8 +71,13 @@ export default function ImagePanel({ host }: { host?: string }) {
   async function doPull() {
     const r = ref.trim();
     if (!r || busy) return;
-    if (!window.confirm(`Pull image "${r}"?\n\nThis contacts the registry and downloads layers.`)) return;
-    if (!ensureAdminToken()) return;
+    const confirmed = await confirmAction({
+      title: "Pull image",
+      message: `Pull image "${r}"?\n\nThis contacts the registry and downloads layers.`,
+      confirmLabel: "Pull",
+      requireAdmin: true,
+    });
+    if (!confirmed) return;
     setBusy("pull");
     setMsg(null);
     try {
@@ -87,13 +94,16 @@ export default function ImagePanel({ host }: { host?: string }) {
 
   async function doPrune(all: boolean) {
     if (busy) return;
-    const ok = window.confirm(
-      all
+    const confirmed = await confirmAction({
+      title: all ? "Prune all images" : "Prune dangling images",
+      message: all
         ? "Prune ALL unused images (not just dangling)?\n\nThis removes every image not referenced by a container."
         : "Prune dangling (untagged) images?\n\nOnly unreferenced image layers are removed.",
-    );
-    if (!ok) return;
-    if (!ensureAdminToken()) return;
+      confirmLabel: "Prune",
+      danger: true,
+      requireAdmin: true,
+    });
+    if (!confirmed) return;
     setBusy(all ? "pruneAll" : "prune");
     setMsg(null);
     try {
@@ -110,8 +120,14 @@ export default function ImagePanel({ host }: { host?: string }) {
   async function doDelete(img: ImageInfo) {
     const target = primaryTag(img) !== "<none>" ? primaryTag(img) : img.id;
     if (busy) return;
-    if (!window.confirm(`Delete image "${target}"?\n\nA forced removal also deletes children/tags using it.`)) return;
-    if (!ensureAdminToken()) return;
+    const confirmed = await confirmAction({
+      title: "Delete image",
+      message: `Delete image "${target}"?\n\nA forced removal also deletes children/tags using it.`,
+      confirmLabel: "Delete",
+      danger: true,
+      requireAdmin: true,
+    });
+    if (!confirmed) return;
     setBusy(img.id);
     setMsg(null);
     try {
@@ -128,14 +144,14 @@ export default function ImagePanel({ host }: { host?: string }) {
   async function doScan(img: ImageInfo) {
     const target = primaryTag(img) !== "<none>" ? primaryTag(img) : img.id;
     if (busy || target === "<none>") return;
-    if (!ensureAdminToken()) return;
+    if (!(await ensureAdminToken())) return;
     setBusy(`scan-${img.id}`);
     setMsg(null);
     try {
       const res = await scanImage(target, host);
       setMsg(`Scanned ${target} — ${res?.total ?? 0} finding(s)`);
     } catch (e) {
-      if (e instanceof ActionError && (e.status === 401 || e.status === 403)) invalidateAdminToken();
+      if (e instanceof ActionError && (e.status === 401 || e.status === 403)) invalidateAdminToken(e.status);
       if (e instanceof ActionError && e.status === 501) setMsg("Trivy is not installed on this host.");
       else setMsg(fail(e, "Scan"));
     } finally {
@@ -241,6 +257,15 @@ export default function ImagePanel({ host }: { host?: string }) {
                       </td>
                       <td className="px-4 py-2 text-right">
                         <div className="flex items-center justify-end gap-1.5">
+                          {primaryTag(img) !== "<none>" && (
+                            <a
+                              href={sbomDownloadURL(primaryTag(img), "cyclonedx", host)}
+                              download
+                              className="rounded border border-surface-border bg-surface/60 px-2 py-0.5 text-[11px] text-slate-300 hover:bg-surface-raised"
+                            >
+                              SBOM
+                            </a>
+                          )}
                           <button
                             type="button"
                             onClick={() => doScan(img)}

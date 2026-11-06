@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +39,23 @@ type Config struct {
 	TrivyBinary    string        // trivy binary name/path; empty → "trivy"
 	ScanSeverities string        // comma list of Trivy severities to report
 	ScanTimeout    time.Duration // per-scan deadline
+
+	// Phase 7: scanner modes + local-only background scheduler. ScanModes maps to
+	// Trivy --scanners (e.g. "vuln,secret,misconfig"). AutoScan, when true, scans
+	// the local host's in-use images every ScanInterval (default off).
+	ScanModes    string        // Trivy scanner modes; empty → "vuln"
+	AutoScan     bool          // enable the background scan scheduler
+	ScanInterval time.Duration // scheduler interval; floored at 5m
+
+	// Phase 8: alerting. AlertInterval is the rule-evaluation tick (floored at
+	// 10s). SMTP* configure the email notification channel; the password is
+	// supplied via flag/env only and never stored in the database.
+	AlertInterval time.Duration
+	SMTPHost      string
+	SMTPPort      int
+	SMTPFrom      string
+	SMTPUser      string
+	SMTPPassword  string
 }
 
 // DefaultConfig returns the baseline configuration derived from general.md.
@@ -52,6 +70,11 @@ func DefaultConfig() Config {
 		TrivyBinary:    "trivy",
 		ScanSeverities: "CRITICAL,HIGH,MEDIUM,LOW",
 		ScanTimeout:    10 * time.Minute,
+		ScanModes:      "vuln",
+		AutoScan:       false,
+		ScanInterval:   24 * time.Hour,
+		AlertInterval:  30 * time.Second,
+		SMTPPort:       587,
 	}
 }
 
@@ -73,6 +96,20 @@ type Server struct {
 	// lastContainerList caches the most recent container list so that new
 	// WebSocket clients receive it immediately on connect.
 	lastContainerList []collector.ContainerInfo
+
+	// statsMu guards lastStats, the most recent live snapshot per container,
+	// consumed by the Prometheus /metrics endpoint.
+	statsMu   sync.Mutex
+	lastStats map[string]collector.ContainerStatsSnapshot
+
+	// Alerting (Phase 8). alertMu guards the in-memory evaluation state that
+	// implements the sustained-window ("for"), cooldown and fire/resolve
+	// transitions; lastContainerState tracks prior container states so exits
+	// are detected by polling (Docker events are not used).
+	notifier           *Notifier
+	alertMu            sync.Mutex
+	alertState         map[string]*alertRuntime
+	lastContainerState map[string]string
 }
 
 // New initialises all subsystems and returns a ready-to-Start Server.
@@ -87,6 +124,9 @@ func New(cfg Config, hub *Hub, dc *collector.DockerClient, hc *collector.HostCol
 		db:  db,
 		agg: collector.NewContainerStatsAggregator(),
 		agents: NewAgentRegistry(),
+		lastStats: map[string]collector.ContainerStatsSnapshot{},
+		alertState:         map[string]*alertRuntime{},
+		lastContainerState: map[string]string{},
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 4096,
@@ -94,6 +134,9 @@ func New(cfg Config, hub *Hub, dc *collector.DockerClient, hc *collector.HostCol
 			CheckOrigin: func(_ *http.Request) bool { return true },
 		},
 	}
+	// The notifier resolves SMTP settings lazily so UI-saved credentials
+	// (which need s.db) take effect without a restart.
+	s.notifier = NewNotifier(cfg, s.smtpConfig)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/host", s.handleHost)
@@ -110,17 +153,36 @@ func New(cfg Config, hub *Hub, dc *collector.DockerClient, hc *collector.HostCol
 	mux.HandleFunc("GET /api/v1/images", s.handleImages)
 	mux.HandleFunc("GET /api/v1/images/layers", s.handleImageLayers)
 	mux.HandleFunc("GET /api/v1/images/vulns", s.handleImageVulns)
+	mux.HandleFunc("GET /api/v1/images/history", s.handleImageHistory)
+	mux.HandleFunc("GET /api/v1/images/sbom", s.handleImageSBOM)
 	mux.HandleFunc("POST /api/v1/images/scan", s.requireAdmin(s.handleImageScan))
 	mux.HandleFunc("GET /api/v1/security/overview", s.handleSecurityOverview)
+	mux.HandleFunc("GET /api/v1/security/report", s.handleSecurityReport)
 	mux.HandleFunc("POST /api/v1/images/pull", s.requireAdmin(s.handleImagePull))
 	mux.HandleFunc("POST /api/v1/images/prune", s.requireAdmin(s.handleImagePrune))
 	mux.HandleFunc("POST /api/v1/images/pruneAll", s.requireAdmin(s.handleImagePruneAll))
 	mux.HandleFunc("DELETE /api/v1/images", s.requireAdmin(s.handleImageDelete))
 	mux.HandleFunc("POST /api/v1/containers/{id}/action", s.requireAdmin(s.handleContainerAction))
 	mux.HandleFunc("DELETE /api/v1/volumes/{name}", s.requireAdmin(s.handleVolumeDelete))
+	// Phase 8: alerting. Reads are open; mutations require the admin token.
+	mux.HandleFunc("GET /api/v1/alerts/rules", s.handleListAlertRules)
+	mux.HandleFunc("POST /api/v1/alerts/rules", s.requireAdmin(s.handleSaveAlertRule))
+	mux.HandleFunc("DELETE /api/v1/alerts/rules/{id}", s.requireAdmin(s.handleDeleteAlertRule))
+	mux.HandleFunc("GET /api/v1/alerts/channels", s.handleListAlertChannels)
+	mux.HandleFunc("POST /api/v1/alerts/channels", s.requireAdmin(s.handleSaveAlertChannel))
+	mux.HandleFunc("DELETE /api/v1/alerts/channels/{id}", s.requireAdmin(s.handleDeleteAlertChannel))
+	mux.HandleFunc("GET /api/v1/alerts", s.handleListAlerts)
+	mux.HandleFunc("GET /api/v1/alerts/active", s.handleActiveAlerts)
+	mux.HandleFunc("POST /api/v1/alerts/test", s.requireAdmin(s.handleTestAlert))
+	mux.HandleFunc("GET /api/v1/alerts/smtp", s.handleGetSMTP)
+	mux.HandleFunc("POST /api/v1/alerts/smtp", s.requireAdmin(s.handleSaveSMTP))
+	mux.HandleFunc("POST /api/v1/alerts/smtp/test", s.requireAdmin(s.handleTestSMTP))
+	mux.HandleFunc("POST /api/v1/alerts/{id}/ack", s.requireAdmin(s.handleAckAlert))
+	mux.HandleFunc("POST /api/v1/alerts/{id}/resolve", s.requireAdmin(s.handleResolveAlert))
 	mux.HandleFunc("GET /api/v1/hosts", s.handleHosts)
 	mux.HandleFunc("GET /ws/agent", s.handleAgentStream)
 	mux.HandleFunc("GET /ws/stream", s.handleWebSocket)
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	// SPA catch-all: must be registered last; Go 1.22 ServeMux always
 	// prefers the most-specific pattern match, so /api/v1/* routes win.
@@ -133,6 +195,8 @@ func New(cfg Config, hub *Hub, dc *collector.DockerClient, hc *collector.HostCol
 		WriteTimeout: 0, // 0 = no timeout; WebSocket connections need long writes
 		IdleTimeout:  120 * time.Second,
 	}
+
+	s.seedAlertDefaults()
 
 	return s
 }
@@ -158,10 +222,21 @@ func (s *Server) Start(ctx context.Context) error {
 	// 3. Auto-start per-container stats + log streams for all running containers
 	go s.discoverAndStream(ctx)
 
+	// 3b. Background image scanner (Phase 7) — local host only, opt-in.
+	if s.cfg.AutoScan {
+		go s.startScanScheduler(ctx)
+	}
+
+	// 3c. Alert rule evaluator (Phase 8) — runs whenever enabled rules exist.
+	go s.startAlertScheduler(ctx)
+
 	// 4. Periodic stats aggregator → hub broadcast
 	go func() {
 		for snap := range s.agg.Output() {
 			s.hub.BroadcastJSONWithHost(s.cfg.LocalHostID, MsgContainerStats, snap)
+			s.statsMu.Lock()
+			s.lastStats[snap.ContainerID] = snap
+			s.statsMu.Unlock()
 		}
 	}()
 
@@ -229,7 +304,10 @@ func (s *Server) discoverAndStream(ctx context.Context) {
 }
 
 func (s *Server) startStreams(ctx context.Context, streamed map[string]struct{}) {
-	containers, err := s.dc.ListContainers(ctx, "running")
+	// Broadcast the FULL container set (running + stopped) so the UI strip can
+	// show exited containers too; live stats/log streams are started only for
+	// the running ones further below.
+	containers, err := s.dc.ListContainers(ctx, "")
 	if err != nil {
 		log.Printf("api: ListContainers: %v", err)
 		return
@@ -248,11 +326,28 @@ func (s *Server) startStreams(ctx context.Context, streamed map[string]struct{})
 		}
 	}
 
-	// Broadcast container list to hub so clients know what's running.
+	// Broadcast container list to hub so clients know what's present (running + stopped).
 	s.hub.BroadcastJSONWithHost(s.cfg.LocalHostID, MsgContainerList, containers)
 	s.lastContainerList = containers
 
+	// Drop cached stats for containers that no longer exist so the /metrics
+	// endpoint and memory stay bounded.
+	s.statsMu.Lock()
+	present := make(map[string]struct{}, len(containers))
 	for _, c := range containers {
+		present[c.ID] = struct{}{}
+	}
+	for id := range s.lastStats {
+		if _, ok := present[id]; !ok {
+			delete(s.lastStats, id)
+		}
+	}
+	s.statsMu.Unlock()
+
+	for _, c := range containers {
+		if c.State != "running" {
+			continue // exited containers show in the list but get no live stream
+		}
 		if _, ok := streamed[c.ID]; ok {
 			continue // already streaming
 		}
@@ -494,19 +589,39 @@ func (s *Server) buildScanOptions() collector.ScanOptions {
 	if d <= 0 {
 		d = 10 * time.Minute
 	}
-	return collector.ScanOptions{Binary: bin, Severities: sev, Timeout: d}
+	modes := s.cfg.ScanModes
+	if modes == "" {
+		modes = "vuln"
+	}
+	return collector.ScanOptions{Binary: bin, Severities: sev, Timeout: d, Modes: modes}
+}
+
+// buildSBOMOptions derives a Trivy SBOM export from the same binary/timeout
+// config; format comes from the request query (cyclonedx default).
+func (s *Server) buildSBOMOptions(format string) collector.SBOMOptions {
+	bin := s.cfg.TrivyBinary
+	if bin == "" {
+		bin = "trivy"
+	}
+	d := s.cfg.ScanTimeout
+	if d <= 0 {
+		d = 10 * time.Minute
+	}
+	return collector.SBOMOptions{Binary: bin, Format: format, Timeout: d}
 }
 
 // scanSummary is the lean POST /images/scan response (counts only; the CVE list
 // is fetched from /images/vulns so the scan reply stays small).
 type scanSummary struct {
-	Ref       string           `json:"ref"`
-	ImageID   string           `json:"image_id"`
-	Scanner   string           `json:"scanner"`
-	ScannedAt time.Time        `json:"scanned_at"`
-	Counts    map[string]int   `json:"counts"`
-	Total     int              `json:"total"`
-	Host      string           `json:"host,omitempty"`
+	Ref            string         `json:"ref"`
+	ImageID        string         `json:"image_id"`
+	Scanner        string         `json:"scanner"`
+	ScannedAt      time.Time      `json:"scanned_at"`
+	Counts         map[string]int `json:"counts"`
+	Total          int            `json:"total"`
+	SecretCount    int            `json:"secret_count"`
+	MisconfigCount int            `json:"misconfig_count"`
+	Host           string         `json:"host,omitempty"`
 }
 
 // POST /api/v1/images/scan?ref=<tag>&host=<id> — run Trivy on the host that owns
@@ -531,7 +646,13 @@ func (s *Server) handleImageScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.db.QueueWrite(func() error { return s.db.SaveImageScan(res) })
+	s.db.QueueWrite(func() error {
+		if err := s.db.SaveImageScan(res); err != nil {
+			return err
+		}
+		return s.db.AppendScanHistory(res)
+	})
+	s.evaluateScan(res) // Phase 8: fire CVE alerts on new breaches
 
 	total := 0
 	for _, n := range res.Counts {
@@ -540,6 +661,7 @@ func (s *Server) handleImageScan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, scanSummary{
 		Ref: res.Ref, ImageID: res.ImageID, Scanner: res.Scanner,
 		ScannedAt: res.ScannedAt, Counts: res.Counts, Total: total,
+		SecretCount: res.SecretCount, MisconfigCount: res.MisconfigCount,
 		Host: r.URL.Query().Get("host"),
 	})
 }
@@ -572,6 +694,95 @@ func (s *Server) handleImageVulns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// GET /api/v1/images/sbom?ref=<tag>&format=cyclonedx|spdx&host=<id> — produce a
+// CycloneDX/SPDX bill-of-materials via Trivy on the host that owns the image and
+// stream it back as a file download.
+func (s *Server) handleImageSBOM(w http.ResponseWriter, r *http.Request) {
+	prov, err := s.providerFor(r)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	ref := strings.TrimSpace(r.URL.Query().Get("ref"))
+	if ref == "" {
+		writeError(w, http.StatusBadRequest, errors.New("ref is required"))
+		return
+	}
+	format := strings.ToLower(r.URL.Query().Get("format"))
+	doc, name, err := prov.ScanSBOM(r.Context(), ref, s.buildSBOMOptions(format))
+	if err != nil {
+		if errors.Is(err, collector.ErrScannerNotAvailable) {
+			writeError(w, http.StatusNotImplemented, err)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(doc); err != nil {
+		log.Printf("api: handleImageSBOM write: %v", err)
+	}
+}
+
+// GET /api/v1/images/history?ref=<tag> — counts-only trend points for one image,
+// oldest-first, feeding the SecurityPanel sparkline. Never-scanned → empty list.
+func (s *Server) handleImageHistory(w http.ResponseWriter, r *http.Request) {
+	ref := strings.TrimSpace(r.URL.Query().Get("ref"))
+	if ref == "" {
+		writeError(w, http.StatusBadRequest, errors.New("ref is required"))
+		return
+	}
+	var imageID string
+	if sc, ok, err := s.db.GetImageScanByRef(ref); err == nil && ok {
+		imageID = sc.ImageID
+	} else if sc, ok, err := s.db.GetImageScan(ref); err == nil && ok {
+		imageID = sc.ImageID
+	}
+	if imageID == "" {
+		writeJSON(w, http.StatusOK, []storage.ScanTrend{})
+		return
+	}
+	hist, err := s.db.GetScanHistory(imageID, 60)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if hist == nil {
+		hist = []storage.ScanTrend{}
+	}
+	writeJSON(w, http.StatusOK, hist)
+}
+
+// GET /api/v1/security/report?format=csv|json — export the current fleet image
+// exposure. json == the overview verbatim; csv == one row per in-use image.
+func (s *Server) handleSecurityReport(w http.ResponseWriter, r *http.Request) {
+	ov, err := s.buildSecurityOverview(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !strings.EqualFold(r.URL.Query().Get("format"), "csv") {
+		writeJSON(w, http.StatusOK, ov)
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="security-report.csv"`)
+	cw := csv.NewWriter(w)
+	defer cw.Flush()
+	_ = cw.Write([]string{"image", "scanned", "critical", "high", "medium", "low", "total", "secrets", "misconfigs", "hosts"})
+	for _, e := range ov.ImageExposure {
+		_ = cw.Write([]string{
+			e.Ref, strconv.FormatBool(e.Scanned),
+			strconv.Itoa(e.Counts["CRITICAL"]), strconv.Itoa(e.Counts["HIGH"]),
+			strconv.Itoa(e.Counts["MEDIUM"]), strconv.Itoa(e.Counts["LOW"]),
+			strconv.Itoa(e.Total), strconv.Itoa(e.SecretCount), strconv.Itoa(e.MisconfigCount),
+			strings.Join(e.Hosts, "|"),
+		})
+	}
+}
+
 // Fleet security response shapes.
 type (
 	HostSecurity struct {
@@ -582,25 +793,39 @@ type (
 		Containers []collector.ContainerSecurity `json:"containers"`
 	}
 	ImageExposure struct {
-		Ref       string         `json:"ref"`
-		Counts    map[string]int `json:"counts"`
-		Total     int            `json:"total"`
-		Scanned   bool           `json:"scanned"`
-		ScannedAt string         `json:"scanned_at,omitempty"`
-		Hosts     []string       `json:"hosts"`
+		Ref            string         `json:"ref"`
+		Counts         map[string]int `json:"counts"`
+		Total          int            `json:"total"`
+		Scanned        bool           `json:"scanned"`
+		ScannedAt      string         `json:"scanned_at,omitempty"`
+		Hosts          []string       `json:"hosts"`
+		SecretCount    int            `json:"secret_count"`
+		MisconfigCount int            `json:"misconfig_count"`
 	}
 	SecurityOverview struct {
-		GeneratedAt     time.Time                  `json:"generated_at"`
-		Hosts           []HostSecurity             `json:"hosts"`
-		ImageExposure   []ImageExposure            `json:"image_exposure"`
+		GeneratedAt     time.Time                     `json:"generated_at"`
+		Hosts           []HostSecurity                `json:"hosts"`
+		ImageExposure   []ImageExposure               `json:"image_exposure"`
 		RiskyContainers []collector.ContainerSecurity `json:"risky_containers"`
+		AutoScan        bool                          `json:"auto_scan"`
+		ScanInterval    string                        `json:"scan_interval,omitempty"`
 	}
 )
 
 // GET /api/v1/security/overview — fleet-wide posture + per-image exposure.
-// Fans out concurrently to the local host and every online agent; offline or
-// erroring hosts are reported with offline=true rather than failing the request.
 func (s *Server) handleSecurityOverview(w http.ResponseWriter, r *http.Request) {
+	overview, err := s.buildSecurityOverview(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, overview)
+}
+
+// buildSecurityOverview fans out concurrently to the local host and every online
+// agent; offline or erroring hosts are reported with offline=true rather than
+// failing the whole overview. Shared by the JSON endpoint and the report export.
+func (s *Server) buildSecurityOverview(ctx context.Context) (SecurityOverview, error) {
 	type target struct {
 		id, name, os string
 		prov         ResourceProvider
@@ -630,7 +855,7 @@ func (s *Server) handleSecurityOverview(w http.ResponseWriter, r *http.Request) 
 				hosts[i].Offline = true
 				return
 			}
-			ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
 			posture, err := t.prov.SecurityPosture(ctx)
 			if err != nil {
@@ -701,6 +926,8 @@ func (s *Server) handleSecurityOverview(w http.ResponseWriter, r *http.Request) 
 		Hosts:           hosts,
 		ImageExposure:   make([]ImageExposure, 0, len(exposures)),
 		RiskyContainers: risky,
+		AutoScan:        s.cfg.AutoScan,
+		ScanInterval:    s.cfg.ScanInterval.String(),
 	}
 	for ref, a := range exposures {
 		ie := ImageExposure{Ref: ref, Hosts: sortedKeys(a.hosts)}
@@ -713,6 +940,8 @@ func (s *Server) handleSecurityOverview(w http.ResponseWriter, r *http.Request) 
 				total += n
 			}
 			ie.Total = total
+			ie.SecretCount = a.scan.SecretCount
+			ie.MisconfigCount = a.scan.MisconfigCount
 		}
 		if ie.Counts == nil {
 			ie.Counts = map[string]int{}
@@ -726,7 +955,7 @@ func (s *Server) handleSecurityOverview(w http.ResponseWriter, r *http.Request) 
 		return overview.ImageExposure[i].Ref < overview.ImageExposure[j].Ref
 	})
 
-	writeJSON(w, http.StatusOK, overview)
+	return overview, nil
 }
 
 // sortedKeys returns the keys of a set in ascending order.
@@ -737,6 +966,81 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// startScanScheduler periodically Trivy-scans the local host's in-use images and
+// records each result plus a history point. Launched only when cfg.AutoScan is
+// set. A missing scanner aborts the loop (it will not appear mid-process);
+// per-image failures are logged and skipped so one bad image never stops the run.
+func (s *Server) startScanScheduler(ctx context.Context) {
+	if s.dc == nil {
+		return
+	}
+	interval := s.cfg.ScanInterval
+	if interval < 5*time.Minute {
+		interval = 5 * time.Minute
+	}
+	opts := s.buildScanOptions()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	// One pass shortly after boot, then on every tick.
+	if scanner := s.scanInUseImages(ctx, opts); !scanner {
+		return // scanner absent → do not keep ticking
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if scanner := s.scanInUseImages(ctx, opts); !scanner {
+				return
+			}
+		}
+	}
+}
+
+// scanInUseImages enumerates unique non-<none> images referenced by containers on
+// the local daemon, scanning each. Returns false when the scanner is unavailable
+// (caller stops the scheduler); true otherwise, even if individual scans fail.
+func (s *Server) scanInUseImages(ctx context.Context, opts collector.ScanOptions) bool {
+	containers, err := s.dc.ListContainers(ctx, "")
+	if err != nil {
+		log.Printf("autoscan: list containers: %v", err)
+		return true
+	}
+	seen := map[string]bool{}
+	for _, c := range containers {
+		ref := c.Image
+		if ref == "" || strings.Contains(ref, "<none>") || seen[ref] {
+			continue
+		}
+		seen[ref] = true
+		sctx, cancel := context.WithTimeout(ctx, opts.Timeout+30*time.Second)
+		res, err := s.dc.ScanImage(sctx, ref, opts)
+		cancel()
+		if err != nil {
+			if errors.Is(err, collector.ErrScannerNotAvailable) {
+				log.Printf("autoscan: scanner not available — disabling scheduler")
+				return false
+			}
+			log.Printf("autoscan: scan %s: %v", ref, err)
+			continue
+		}
+		s.db.QueueWrite(func() error {
+			if err := s.db.SaveImageScan(res); err != nil {
+				return err
+			}
+			return s.db.AppendScanHistory(res)
+		})
+		s.evaluateScan(res) // Phase 8: fire CVE alerts on new breaches
+		total := 0
+		for _, n := range res.Counts {
+			total += n
+		}
+		log.Printf("autoscan: %s → %d finding(s)", ref, total)
+	}
+	return true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -876,7 +1180,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Send cached container list immediately (don't wait for 30s tick).
 	if len(s.lastContainerList) == 0 && s.dc != nil {
 		// First client connected before discoverAndStream finished — fetch now.
-		if ctrs, err := s.dc.ListContainers(r.Context(), "running"); err == nil {
+		if ctrs, err := s.dc.ListContainers(r.Context(), ""); err == nil {
 			s.lastContainerList = ctrs
 		}
 	}

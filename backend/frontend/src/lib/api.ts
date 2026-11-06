@@ -1,11 +1,16 @@
 import { API_BASE } from "./constants";
+import { requestAdminToken } from "./adminAuth";
 
 // ── Admin token (localStorage) ────────────────────────────────────────────────
 // Mutating endpoints (pull/prune/delete/start/stop/…) require a Bearer token
 // when the server was started with -admin-token. We keep it in localStorage so
-// it survives reloads; the UI prompts for it the first time an action needs it.
+// it survives reloads; the UI opens a styled modal (see AdminTokenModal) the
+// first time an action needs it, instead of the old window.prompt.
 
 const TOKEN_KEY = "monitor.adminToken";
+
+// Broadcast so the header lock/unlock chip re-renders whenever the token changes.
+const TOKEN_EVENT = "monitor:admin-token";
 
 export function getAdminToken(): string {
   try {
@@ -22,6 +27,13 @@ export function setAdminToken(token: string): void {
   } catch {
     /* storage unavailable (private mode) — actions will just 401 */
   }
+  window.dispatchEvent(new Event(TOKEN_EVENT));
+}
+
+/** Subscribe to admin-token changes; returns an unsubscribe function. */
+export function onAdminTokenChange(cb: () => void): () => void {
+  window.addEventListener(TOKEN_EVENT, cb);
+  return () => window.removeEventListener(TOKEN_EVENT, cb);
 }
 
 /** Authorization headers for a mutating call (empty when no token is set). */
@@ -31,23 +43,27 @@ export function authHeaders(): Record<string, string> {
 }
 
 /**
- * Return the stored admin token, prompting once if none is set. Returning an
- * empty string means the user cancelled — callers should abort the action then.
+ * Return the stored admin token, opening the modal to collect one if none is
+ * set. Resolves to an empty string when the user cancels — callers must abort
+ * the action then. The modal persists the token itself, so we just await it.
  */
-export function ensureAdminToken(): string {
+export async function ensureAdminToken(): Promise<string> {
   const existing = getAdminToken();
   if (existing) return existing;
-  const entered = window.prompt(
-    "This action needs the admin access token (the server's -admin-token).\n\nEnter it below, or leave blank to cancel.",
-  );
-  const token = (entered ?? "").trim();
-  if (token) setAdminToken(token);
-  return token;
+  return (await requestAdminToken()).trim();
 }
 
-/** Clear a now-invalid token so the next action re-prompts. */
-export function invalidateAdminToken(): void {
+/**
+ * Clear a now-invalid token so the next action re-prompts. When the server
+ * rejected the token (401) we immediately reopen the modal with an inline error
+ * so the user can correct it; 403 means actions are disabled server-side, so we
+ * stay quiet (no token would ever work).
+ */
+export function invalidateAdminToken(status?: number): void {
   setAdminToken("");
+  if (status === 401) {
+    requestAdminToken("That token was rejected by the server. Please try again.");
+  }
 }
 
 // ── Host scoping ───────────────────────────────────────────────────────────────
@@ -79,10 +95,14 @@ export async function apiAction<T = unknown>(
   method: "POST" | "DELETE",
   path: string,
   host?: string,
+  body?: unknown,
 ): Promise<T | null> {
+  const headers: Record<string, string> = { ...authHeaders() };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
   const res = await fetch(withHost(`${API_BASE}${path}`, host), {
     method,
-    headers: authHeaders(),
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;

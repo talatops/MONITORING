@@ -10,11 +10,19 @@ import "time"
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ScanOptions configures a Trivy image scan. Zero values fall back to the
-// defaults set by the API layer (binary "trivy", all severities, 10 m timeout).
+// defaults set by the API layer (binary "trivy", vuln-only, 10 m timeout).
 type ScanOptions struct {
 	Binary     string        `json:"binary"`     // trivy binary name/path (PATH lookup)
 	Severities string        `json:"severities"` // comma list, e.g. "CRITICAL,HIGH"
 	Timeout    time.Duration `json:"timeout"`    // overall scan deadline
+	Modes      string        `json:"modes"`       // Trivy --scanners list, e.g. "vuln,secret,misconfig"; empty => "vuln"
+}
+
+// SBOMOptions configures an on-demand CycloneDX/SPDX bill-of-materials export.
+type SBOMOptions struct {
+	Binary  string        `json:"binary"`
+	Format  string        `json:"format"` // "cyclonedx" | "spdx"; empty => cyclonedx
+	Timeout time.Duration `json:"timeout"`
 }
 
 // Vulnerability is one CVE finding for a package inside an image.
@@ -27,16 +35,41 @@ type Vulnerability struct {
 	Title            string `json:"title,omitempty"`
 }
 
+// SecretFinding is one leaked-secret result from Trivy's secret scanner.
+type SecretFinding struct {
+	RuleID    string `json:"rule_id"`
+	Severity  string `json:"severity"`
+	Category  string `json:"category"`
+	Title     string `json:"title"`
+	Match     string `json:"match"`
+	File      string `json:"file"`
+}
+
+// MisconfigFinding is one IaC/Dockerfile misconfiguration result.
+type MisconfigFinding struct {
+	ID         string   `json:"id"`
+	Title      string   `json:"title"`
+	Severity   string   `json:"severity"`
+	Resolution string   `json:"resolution"`
+	Type       string   `json:"type"`
+	Messages   []string `json:"messages,omitempty"`
+}
+
 // ImageVulnScan is the normalised result of scanning one image. Counts holds
 // per-severity totals (CRITICAL/HIGH/MEDIUM/LOW/UNKNOWN). An empty Vulnerabilities
-// list means the image was scanned and found clean (not an error).
+// list means the image was scanned and found clean (not an error). Secrets and
+// Misconfigurations are populated only when those scanners are enabled (Modes).
 type ImageVulnScan struct {
-	Ref             string          `json:"ref"`
-	ImageID         string          `json:"image_id"`
-	Scanner         string          `json:"scanner"` // e.g. "trivy"
-	ScannedAt       time.Time       `json:"scanned_at"`
-	Counts          map[string]int  `json:"counts"`
-	Vulnerabilities []Vulnerability `json:"vulnerabilities"`
+	Ref              string             `json:"ref"`
+	ImageID          string             `json:"image_id"`
+	Scanner          string             `json:"scanner"` // e.g. "trivy"
+	ScannedAt        time.Time          `json:"scanned_at"`
+	Counts           map[string]int     `json:"counts"`
+	Vulnerabilities  []Vulnerability    `json:"vulnerabilities"`
+	Secrets          []SecretFinding    `json:"secrets,omitempty"`
+	Misconfigurations []MisconfigFinding `json:"misconfigurations,omitempty"`
+	SecretCount      int                `json:"secret_count"`
+	MisconfigCount   int                `json:"misconfig_count"`
 }
 
 // ContainerSecurity is the live security posture of one container, read from

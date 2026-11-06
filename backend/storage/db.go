@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // registers the "sqlite" driver with database/sql
@@ -140,14 +141,80 @@ CREATE TABLE IF NOT EXISTS image_scans (
     vulns_json  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS scan_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    image_id        TEXT,
+    ref             TEXT,
+    scanned_at      TEXT,
+    counts_json     TEXT,
+    total           INTEGER,
+    secret_count    INTEGER,
+    misconfig_count INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id   TEXT PRIMARY KEY,
+    body TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alert_channels (
+    id   TEXT PRIMARY KEY,
+    body TEXT NOT NULL
+);
+
+-- Generic key/value settings store (e.g. the SMTP config saved from the UI).
+-- Values are opaque JSON strings; secrets within them are encrypted by the
+-- caller before they reach storage.
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id          TEXT PRIMARY KEY,
+    rule_id     TEXT,
+    rule_name   TEXT,
+    type        TEXT,
+    severity    TEXT,
+    status      TEXT,
+    resource    TEXT,
+    metric      TEXT,
+    value       REAL,
+    threshold   REAL,
+    summary     TEXT,
+    detail      TEXT,
+    started_at  TEXT,
+    resolved_at TEXT,
+    notified    TEXT,
+    acked       INTEGER DEFAULT 0,
+    acked_at    TEXT,
+    ack_note    TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_host_ts      ON host_metrics(ts);
 CREATE INDEX IF NOT EXISTS idx_logs_cid_ts  ON container_logs(container_id, ts);
+CREATE INDEX IF NOT EXISTS idx_history_img_ts ON scan_history(image_id, scanned_at);
+CREATE INDEX IF NOT EXISTS idx_alerts_status_ts ON alerts(status, started_at);
 `
 
 func (db *DB) migrate() error {
 	_, err := db.handle.Exec(schema)
 	if err != nil {
 		return fmt.Errorf("storage: migrate: %w", err)
+	}
+	// Schema above only creates missing tables; it never adds columns to an
+	// existing one. Alerts introduced ack columns after the fact, so backfill
+	// them for databases created before that change (SQLite errors on a
+	// duplicate column, which we ignore).
+	for _, col := range []string{
+		`ALTER TABLE alerts ADD COLUMN acked INTEGER DEFAULT 0`,
+		`ALTER TABLE alerts ADD COLUMN acked_at TEXT`,
+		`ALTER TABLE alerts ADD COLUMN ack_note TEXT`,
+	} {
+		if _, err := db.handle.Exec(col); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("storage: migrate alert column: %w", err)
+		}
 	}
 	return nil
 }
@@ -291,6 +358,78 @@ func (db *DB) ListImageScans() ([]collector.ImageVulnScan, error) {
 			return nil, fmt.Errorf("storage: scan image row: %w", err)
 		}
 		out = append(out, scanRow(id, ref, scanner, scannedAt, countsJSON, vulnsJSON))
+	}
+	return out, rows.Err()
+}
+
+// ScanTrend is one lightweight history point: the severity counts (plus secret
+// and misconfig totals) recorded for an image at a scan time. It powers the
+// per-image CVE trend chart; the full finding detail stays in image_scans.
+type ScanTrend struct {
+	ScannedAt      string         `json:"scanned_at"`
+	Counts         map[string]int `json:"counts"`
+	Total          int            `json:"total"`
+	SecretCount    int            `json:"secret_count"`
+	MisconfigCount int            `json:"misconfig_count"`
+}
+
+// AppendScanHistory records a counts-only history row for one scan result. Called
+// alongside SaveImageScan on every scan (on-demand or scheduled). Errors are the
+// caller's to log; a failure here must not fail the scan response.
+func (db *DB) AppendScanHistory(s collector.ImageVulnScan) error {
+	counts, err := json.Marshal(s.Counts)
+	if err != nil {
+		return fmt.Errorf("storage: marshal history counts: %w", err)
+	}
+	total := 0
+	for _, n := range s.Counts {
+		total += n
+	}
+	_, err = db.handle.Exec(
+		`INSERT INTO scan_history (image_id, ref, scanned_at, counts_json, total, secret_count, misconfig_count)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		s.ImageID, s.Ref, s.ScannedAt.UTC().Format(time.RFC3339Nano),
+		string(counts), total, s.SecretCount, s.MisconfigCount,
+	)
+	if err != nil {
+		return fmt.Errorf("storage: AppendScanHistory: %w", err)
+	}
+	return nil
+}
+
+// GetScanHistory returns up to `limit` most-recent trend points for an image ID,
+// ordered oldest-first (ready to plot on a time axis).
+func (db *DB) GetScanHistory(imageID string, limit int) ([]ScanTrend, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := db.handle.Query(
+		`SELECT scanned_at, counts_json, total, secret_count, misconfig_count
+		 FROM scan_history WHERE image_id = ? ORDER BY scanned_at DESC LIMIT ?`,
+		imageID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("storage: GetScanHistory: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ScanTrend
+	for rows.Next() {
+		var scannedAt, countsJSON string
+		var t ScanTrend
+		if err := rows.Scan(&scannedAt, &countsJSON, &t.Total, &t.SecretCount, &t.MisconfigCount); err != nil {
+			return nil, fmt.Errorf("storage: scan history row: %w", err)
+		}
+		_ = json.Unmarshal([]byte(countsJSON), &t.Counts)
+		if t.Counts == nil {
+			t.Counts = map[string]int{}
+		}
+		t.ScannedAt = scannedAt
+		out = append(out, t)
+	}
+	// Query returned newest-first; reverse to oldest-first for plotting.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
 	}
 	return out, rows.Err()
 }
@@ -463,10 +602,15 @@ func (db *DB) Prune() (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("storage: prune container_logs: %w", err)
 	}
+	res3, err := db.handle.Exec(`DELETE FROM scan_history WHERE scanned_at < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("storage: prune scan_history: %w", err)
+	}
 
 	n1, _ := res1.RowsAffected()
 	n2, _ := res2.RowsAffected()
-	return n1 + n2, nil
+	n3, _ := res3.RowsAffected()
+	return n1 + n2 + n3, nil
 }
 
 // StartPruneTicker runs Prune() every `interval` until ctx is cancelled.

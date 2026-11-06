@@ -32,6 +32,7 @@ const (
 	MsgContainerLog   = "container_log"
 	MsgContainerList  = "container_list"
 	MsgKernelEvent    = "kernel_event"
+	MsgAlert          = "alert" // Phase 8: firing/resolved alert pushed live to the UI
 )
 
 // ─────────────────────────────────────────────────────────────────────────────

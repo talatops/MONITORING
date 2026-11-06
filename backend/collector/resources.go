@@ -32,6 +32,7 @@ type TopologyNode struct {
 type TopologyEdge struct {
 	Source string `json:"source"`
 	Target string `json:"target"`
+	IP     string `json:"ip,omitempty"` // container's IPv4 on that network, if any
 }
 
 // Topology is a bipartite container<->network graph — the connections the
@@ -47,6 +48,16 @@ func (dc *DockerClient) NetworkTopology(ctx context.Context) (Topology, error) {
 	nets, err := dc.CLI.NetworkList(ctx, network.ListOptions{})
 	if err != nil {
 		return Topology{}, fmt.Errorf("collector: NetworkList: %w", err)
+	}
+
+	// Map container name -> running state so the UI can colour nodes correctly.
+	stateByName := map[string]string{}
+	if list, err := dc.CLI.ContainerList(ctx, container.ListOptions{All: true}); err == nil {
+		for _, c := range list {
+			for _, nm := range c.Names {
+				stateByName[strings.TrimPrefix(nm, "/")] = string(c.State)
+			}
+		}
 	}
 
 	var topo Topology
@@ -77,13 +88,17 @@ func (dc *DockerClient) NetworkTopology(ctx context.Context) (Topology, error) {
 			if !nodeSeen[cID] {
 				nodeSeen[cID] = true
 				topo.Nodes = append(topo.Nodes, TopologyNode{
-					ID: cID, Type: "container", Label: name,
+					ID: cID, Type: "container", Label: name, State: stateByName[name],
 				})
+			}
+			ip := ep.IPv4Address
+			if slash := strings.Index(ip, "/"); slash >= 0 {
+				ip = ip[:slash]
 			}
 			key := cID + "->" + netID
 			if !edgeSeen[key] {
 				edgeSeen[key] = true
-				topo.Edges = append(topo.Edges, TopologyEdge{Source: cID, Target: netID})
+				topo.Edges = append(topo.Edges, TopologyEdge{Source: cID, Target: netID, IP: ip})
 			}
 		}
 	}

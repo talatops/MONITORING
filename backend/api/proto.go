@@ -62,6 +62,7 @@ const (
 	ActContainerAct        = "container.action"
 	ActVolumeRemove        = "volume.remove"
 	ActImageScan           = "image.scan"
+	ActImageSBOM           = "image.sbom"
 	ActSecurityPosture     = "security.posture"
 )
 
@@ -94,7 +95,18 @@ type (
 		Force bool   `json:"force"`
 	}
 	ArgImageScan struct {
-		Ref  string               `json:"ref"`
+		Ref  string                `json:"ref"`
 		Opts collector.ScanOptions `json:"opts"`
 	}
+	ArgImageSBOM struct {
+		Ref  string                `json:"ref"`
+		Opts collector.SBOMOptions `json:"opts"`
+	}
 )
+
+// SBOMResult is the agent->hub payload for an SBOM export: the raw CycloneDX/
+// SPDX document plus the suggested download filename.
+type SBOMResult struct {
+	Doc  json.RawMessage `json:"doc"`
+	Name string          `json:"name"`
+}

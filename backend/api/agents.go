@@ -179,11 +179,12 @@ func (a *AgentConn) request(ctx context.Context, reqID, action string, args any,
 type AgentRegistry struct {
 	mu    sync.RWMutex
 	conns map[string]*AgentConn
+	known map[string]HostInfo // last-seen metadata for every agent that connected
 	seq   uint64
 }
 
 func NewAgentRegistry() *AgentRegistry {
-	return &AgentRegistry{conns: map[string]*AgentConn{}}
+	return &AgentRegistry{conns: map[string]*AgentConn{}, known: map[string]HostInfo{}}
 }
 
 func (rg *AgentRegistry) add(a *AgentConn) {
@@ -192,6 +193,7 @@ func (rg *AgentRegistry) add(a *AgentConn) {
 		old.shutdown() // replace a stale conn for the same host id
 	}
 	rg.conns[a.hostID] = a
+	rg.known[a.hostID] = HostInfo{ID: a.hostID, Name: a.name, Kind: "agent", Online: true, OS: a.os, NumCPU: a.numCPU}
 	rg.mu.Unlock()
 	log.Printf("api: agent registered host=%s name=%s", a.hostID, a.name)
 }
@@ -221,6 +223,20 @@ func (rg *AgentRegistry) List() []HostInfo {
 	out := make([]HostInfo, 0, len(rg.conns))
 	for id, a := range rg.conns {
 		out = append(out, HostInfo{ID: id, Name: a.name, Kind: "agent", Online: true, OS: a.os, NumCPU: a.numCPU})
+	}
+	return out
+}
+
+// AllHosts returns every agent that has ever connected, marking those not
+// currently connected as offline. Powers the "host offline" alert rule.
+func (rg *AgentRegistry) AllHosts() []HostInfo {
+	rg.mu.RLock()
+	defer rg.mu.RUnlock()
+	out := make([]HostInfo, 0, len(rg.known))
+	for id, info := range rg.known {
+		_, online := rg.conns[id]
+		info.Online = online
+		out = append(out, info)
 	}
 	return out
 }

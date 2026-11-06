@@ -164,15 +164,20 @@ export default function ContainerList({
     const el = trackRef.current;
     if (!el) return;
     const n = visible.length;
-    const first = el.children[0] as HTMLElement | undefined;
+    if (n === 0) return;
+    const first = el.children[0] as HTMLElement;
+    // Width of a single copy: when duplicated, the gap between copy 1 and copy 2;
+    // when a lone copy, the span from the first card to the end of the last.
     const second = el.children[n] as HTMLElement | undefined;
-    const oneCopy =
-      first && second
-        ? second.offsetLeft - first.offsetLeft
-        : Math.round(el.scrollWidth / 3);
+    const last = el.children[Math.min(n, el.children.length) - 1] as HTMLElement;
+    const oneCopy = second
+      ? second.offsetLeft - first.offsetLeft
+      : last.offsetLeft + last.offsetWidth - first.offsetLeft;
+    const wrapWidth = el.parentElement?.clientWidth ?? el.clientWidth;
     setShiftPx(oneCopy);
-    setOverflowing(el.scrollWidth > el.clientWidth + 1);
-  }, [visible.length]);
+    // Only scroll (and only duplicate) when one copy genuinely overflows the row.
+    setOverflowing(oneCopy > wrapWidth + 1);
+  }, [visible.length, overflowing]);
 
   // Constant speed regardless of card count: duration = distance / speed.
   // Paused when the row already fits (no need to scroll) or the modal is open;
@@ -197,7 +202,7 @@ export default function ContainerList({
             className={`marquee-track flex gap-4 py-1${paused ? " paused" : ""}`}
             style={trackStyle}
           >
-            {[...visible, ...visible, ...visible].map((c, i) => (
+            {(overflowing ? [...visible, ...visible, ...visible] : visible).map((c, i) => (
               <div key={`${c.id}-${i}`} className="w-72 shrink-0">
                 <ContainerCard container={c} stats={stats[c.id]} onSelect={setSelectedId} />
               </div>

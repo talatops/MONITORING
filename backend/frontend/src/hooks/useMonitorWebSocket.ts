@@ -11,6 +11,7 @@ import type {
   WSStatus,
 } from "../types";
 import { HOST_HISTORY_LIMIT, KERNEL_EVENT_LIMIT, LOG_BUFFER_LIMIT, WS_URL } from "../lib/constants";
+import { pushToast } from "../lib/toast";
 
 /** Live, in-memory metrics for a single host (local or remote agent). */
 export interface HostBucket {
@@ -80,6 +81,18 @@ export function useMonitorWebSocket(enabled = true) {
     try {
       msg = JSON.parse(raw) as TypedWSMessage;
     } catch {
+      return;
+    }
+
+    // Alerts are ephemeral notifications, not per-host live state: pop a toast
+    // and stop here so they never touch the metrics buffers.
+    if (msg.type === "alert") {
+      const a = msg.data;
+      pushToast({
+        title: `${a.status === "resolved" ? "Resolved" : "Alert"} · ${a.rule_name}`,
+        body: a.summary,
+        tone: a.status === "resolved" ? "emerald" : a.severity === "critical" ? "red" : "amber",
+      });
       return;
     }
 

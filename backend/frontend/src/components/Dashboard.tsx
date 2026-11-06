@@ -9,6 +9,10 @@ import VolumePanel from "./VolumePanel";
 import ImagePanel from "./ImagePanel";
 import KernelEventsPanel from "./KernelEventsPanel";
 import SecurityPanel from "./SecurityPanel";
+import AlertsPanel from "./AlertsPanel";
+import AdminTokenModal, { AdminLockChip } from "./AdminTokenModal";
+import ConfirmDialog from "./ConfirmDialog";
+import ToastHost from "./ToastHost";
 import { emptyBucket, type MonitorState } from "../hooks/useMonitorWebSocket";
 import { useHostHistoryRange } from "../hooks/useHostHistoryRange";
 import { useHosts } from "../hooks/useResources";
@@ -57,7 +61,7 @@ export default function Dashboard({ state }: { state: MonitorState }) {
   const { latestHost, hostHistory, containers, containerStats, logs, kernelEvents } = bucket;
 
   const [range, setRange] = useState("live");
-  const [view, setView] = useState<"overview" | "topology" | "volumes" | "images" | "security">("overview");
+  const [view, setView] = useState<"overview" | "topology" | "volumes" | "images" | "security" | "alerts">("overview");
   // DB-backed history is a local-only feature; remote hosts are live-only.
   const { data: rangeData, loading: rangeLoading } = useHostHistoryRange(isRemote ? "live" : range);
   const chartHistory = range === "live" || isRemote ? hostHistory : rangeData;
@@ -99,6 +103,7 @@ export default function Dashboard({ state }: { state: MonitorState }) {
               ))}
             </select>
           )}
+          <AdminLockChip />
           <StatusDot status={status} />
         </div>
       </header>
@@ -113,6 +118,7 @@ export default function Dashboard({ state }: { state: MonitorState }) {
             ["volumes", "Volumes"],
             ["images", "Images"],
             ["security", "Security"],
+            ["alerts", "Alerts"],
           ] as const).map(([value, label]) => (
             <button
               key={value}
@@ -204,6 +210,7 @@ export default function Dashboard({ state }: { state: MonitorState }) {
         {view === "volumes" && <VolumePanel host={activeHost} />}
         {view === "images" && <ImagePanel host={activeHost} />}
         {view === "security" && <SecurityPanel />}
+        {view === "alerts" && <AlertsPanel />}
 
       </main>
 
@@ -211,6 +218,15 @@ export default function Dashboard({ state }: { state: MonitorState }) {
       <footer className="border-t border-surface-border px-5 py-2 text-center text-xs text-slate-600">
         Cross-platform monitoring · Linux Unix Socket · Windows Named Pipe
       </footer>
+
+      {/* Admin-token unlock modal (driven by lib/adminAuth store) */}
+      <AdminTokenModal />
+
+      {/* Destructive-action confirmation card (driven by lib/confirm store) */}
+      <ConfirmDialog />
+
+      {/* Live alert toasts (driven by lib/toast store, fed by the WebSocket) */}
+      <ToastHost />
     </div>
   );
 }

@@ -323,6 +323,16 @@ func executeCommand(ctx context.Context, dc *collector.DockerClient, action stri
 			return nil, err
 		}
 		return marshal(dc.ScanImage(ctx, a.Ref, a.Opts))
+	case api.ActImageSBOM:
+		var a api.ArgImageSBOM
+		if err := decode(&a); err != nil {
+			return nil, err
+		}
+		doc, name, err := dc.ScanSBOM(ctx, a.Ref, a.Opts)
+		if err != nil {
+			return nil, err
+		}
+		return marshal(api.SBOMResult{Doc: doc, Name: name}, nil)
 	case api.ActSecurityPosture:
 		return marshal(dc.SecurityPosture(ctx))
 	default:

@@ -1,0 +1,23 @@
+# Keep the build context small and reproducible. Node modules and the local
+# dist are rebuilt inside the image; the stale cmd/server/dist must NOT be
+# shipped or it fights the `COPY --from=web` SPA.
+.git
+.gitignore
+*.db
+*.db-wal
+*.db-shm
+data/
+
+# Frontend build artifacts (rebuilt in the `web` stage).
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# Go build artifacts (rebuilt in the `build` stage).
+cmd/server/dist
+bin/
+out/
+*.exe
+
+# Docs are not needed to compile.
+../docs

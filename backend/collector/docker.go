@@ -65,6 +65,16 @@ func NewDockerClient(dockerHost string) (*DockerClient, error) {
 	}, nil
 }
 
+// Ping reports whether the Docker daemon is reachable. Used by offline alerts
+// to detect a down local daemon (nil receiver = client never initialised).
+func (dc *DockerClient) Ping(ctx context.Context) error {
+	if dc == nil || dc.CLI == nil {
+		return fmt.Errorf("collector: no docker client")
+	}
+	_, err := dc.CLI.Ping(ctx)
+	return err
+}
+
 // DefaultEndpoint returns the platform-correct Docker socket URI per
 // the compatibility rules in general.md §2.
 func DefaultEndpoint() string {
